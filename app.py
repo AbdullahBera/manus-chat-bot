@@ -153,7 +153,7 @@ def handle_message(channel: str, user: str, text: str, bot_user_id: str) -> None
     try:
         thinking_resp = slack_client.chat_postMessage(
             channel=channel,
-            text=":hourglass_flowing_sand: Thinking...",
+            text=":hourglass_flowing_sand: Thinking... (this may take up to 60 seconds)",
         )
         thinking_ts = thinking_resp["ts"]
     except SlackApiError as e:
@@ -175,12 +175,16 @@ def handle_message(channel: str, user: str, text: str, bot_user_id: str) -> None
     # Poll for result
     reply = manus_poll_result(task_id)
 
-    # Delete the "thinking" message and post the real reply
+    # Update the "thinking" message in-place with the real reply
+    # This avoids permission issues with chat:write vs chat:write.public
     if thinking_ts:
         try:
-            slack_client.chat_delete(channel=channel, ts=thinking_ts)
-        except SlackApiError:
-            pass
+            slack_client.chat_update(channel=channel, ts=thinking_ts, text=reply)
+            log.info("Updated thinking message with reply for channel %s", channel)
+            return
+        except SlackApiError as e:
+            log.warning("chat_update failed (%s), falling back to new message", e)
+            # Fall through to post a new message
 
     try:
         slack_client.chat_postMessage(channel=channel, text=reply)
