@@ -20,10 +20,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-MANUS_API_KEY   = os.environ["MANUS_API_KEY"]
-SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
+MANUS_API_KEY        = os.environ["MANUS_API_KEY"]
+SLACK_BOT_TOKEN      = os.environ["SLACK_BOT_TOKEN"]
 SLACK_SIGNING_SECRET = os.environ["SLACK_SIGNING_SECRET"]
-MANUS_API_BASE  = "https://api.manus.ai/v2"
+MANUS_API_BASE       = "https://api.manus.ai/v2"
 
 # ── Clients ───────────────────────────────────────────────────────────────────
 app = Flask(__name__)
@@ -35,6 +35,9 @@ verifier = SignatureVerifier(SLACK_SIGNING_SECRET)
 conversation_store: dict[str, str] = {}
 # Dedup processed Slack event IDs
 processed_events: set[str] = set()
+
+# Cache bot user ID so we don't call auth_test on every message
+_bot_user_id: str = ""
 
 # ── Manus API helpers ─────────────────────────────────────────────────────────
 
@@ -52,11 +55,14 @@ def manus_create_task(user_message: str) -> str | None:
             "content": user_message,
         }
     }
-    resp = requests.post(f"{MANUS_API_BASE}/task.create", json=payload, headers=HEADERS, timeout=30)
-    data = resp.json()
-    if data.get("ok"):
-        return data["data"]["task_id"]
-    log.error("task.create failed: %s", data)
+    try:
+        resp = requests.post(f"{MANUS_API_BASE}/task.create", json=payload, headers=HEADERS, timeout=30)
+        data = resp.json()
+        if data.get("ok"):
+            return data["data"]["task_id"]
+        log.error("task.create failed: %s", data)
+    except Exception as e:
+        log.error("task.create exception: %s", e)
     return None
 
 
@@ -69,10 +75,13 @@ def manus_send_message(task_id: str, user_message: str) -> None:
             "content": user_message,
         }
     }
-    resp = requests.post(f"{MANUS_API_BASE}/task.sendMessage", json=payload, headers=HEADERS, timeout=30)
-    data = resp.json()
-    if not data.get("ok"):
-        log.error("task.sendMessage failed: %s", data)
+    try:
+        resp = requests.post(f"{MANUS_API_BASE}/task.sendMessage", json=payload, headers=HEADERS, timeout=30)
+        data = resp.json()
+        if not data.get("ok"):
+            log.error("task.sendMessage failed: %s", data)
+    except Exception as e:
+        log.error("task.sendMessage exception: %s", e)
 
 
 def manus_poll_result(task_id: str, timeout: int = 300) -> str:
@@ -89,8 +98,13 @@ def manus_poll_result(task_id: str, timeout: int = 300) -> str:
         if last_seen_cursor:
             params["cursor"] = last_seen_cursor
 
-        resp = requests.get(f"{MANUS_API_BASE}/task.listMessages", params=params, headers=HEADERS, timeout=30)
-        data = resp.json()
+        try:
+            resp = requests.get(f"{MANUS_API_BASE}/task.listMessages", params=params, headers=HEADERS, timeout=30)
+            data = resp.json()
+        except Exception as e:
+            log.error("task.listMessages exception: %s", e)
+            time.sleep(5)
+            continue
 
         if not data.get("ok"):
             log.error("task.listMessages failed: %s", data)
@@ -122,6 +136,7 @@ def manus_poll_result(task_id: str, timeout: int = 300) -> str:
                         return "\n\n".join(result_parts) if result_parts else "Manus is waiting for your input."
 
         if agent_status == "stopped":
+            log.info("Task %s stopped, collected %d parts", task_id, len(result_parts))
             break
         if agent_status == "error":
             return "Manus encountered an error while processing your request."
@@ -138,6 +153,17 @@ def manus_poll_result(task_id: str, timeout: int = 300) -> str:
     return "Manus did not return a response in time. Please try again."
 
 
+def post_to_slack(channel: str, text: str) -> bool:
+    """Post a message to Slack. Returns True on success."""
+    try:
+        result = slack_client.chat_postMessage(channel=channel, text=text)
+        log.info("Posted message to %s, ts=%s", channel, result.get("ts"))
+        return True
+    except SlackApiError as e:
+        log.error("chat_postMessage failed for channel %s: %s", channel, e)
+        return False
+
+
 # ── Core handler (runs in background thread) ──────────────────────────────────
 
 def handle_message(channel: str, user: str, text: str, bot_user_id: str) -> None:
@@ -149,53 +175,38 @@ def handle_message(channel: str, user: str, text: str, bot_user_id: str) -> None
 
     log.info("Handling message from %s in %s: %s", user, channel, clean_text[:80])
 
-    # Post a "thinking" indicator
-    try:
-        thinking_resp = slack_client.chat_postMessage(
-            channel=channel,
-            text=":hourglass_flowing_sand: Thinking... (this may take up to 60 seconds)",
-        )
-        thinking_ts = thinking_resp["ts"]
-    except SlackApiError as e:
-        log.error("Failed to post thinking message: %s", e)
-        thinking_ts = None
+    # Post a "thinking" indicator immediately
+    post_to_slack(channel, ":hourglass_flowing_sand: Thinking... (this may take up to 60 seconds)")
 
     # Create or continue Manus task
     task_id = conversation_store.get(channel)
     if task_id:
+        log.info("Continuing existing task %s for channel %s", task_id, channel)
         manus_send_message(task_id, clean_text)
     else:
+        log.info("Creating new task for channel %s", channel)
         task_id = manus_create_task(clean_text)
         if not task_id:
-            slack_client.chat_postMessage(channel=channel, text="Sorry, I couldn't reach Manus. Please try again.")
+            post_to_slack(channel, "Sorry, I couldn't reach Manus. Please try again.")
             return
         conversation_store[channel] = task_id
         log.info("New Manus task %s for channel %s", task_id, channel)
 
     # Poll for result
+    log.info("Polling for result on task %s", task_id)
     reply = manus_poll_result(task_id)
+    log.info("Got reply for task %s, length=%d chars", task_id, len(reply))
 
-    # Update the "thinking" message in-place with the real reply
-    # This avoids permission issues with chat:write vs chat:write.public
-    if thinking_ts:
-        try:
-            slack_client.chat_update(channel=channel, ts=thinking_ts, text=reply)
-            log.info("Updated thinking message with reply for channel %s", channel)
-            return
-        except SlackApiError as e:
-            log.warning("chat_update failed (%s), falling back to new message", e)
-            # Fall through to post a new message
-
-    try:
-        slack_client.chat_postMessage(channel=channel, text=reply)
-    except SlackApiError as e:
-        log.error("Failed to post reply: %s", e)
+    # Post the reply as a fresh message
+    post_to_slack(channel, reply)
 
 
 # ── Slack Events endpoint ─────────────────────────────────────────────────────
 
 @app.route("/slack/events", methods=["POST"])
 def slack_events():
+    global _bot_user_id
+
     # Verify Slack signature
     if not verifier.is_valid_request(request.get_data(), request.headers):
         return jsonify({"error": "invalid signature"}), 403
@@ -228,24 +239,30 @@ def slack_events():
     if event.get("bot_id"):
         return jsonify({"ok": True})
 
-    channel  = event.get("channel", "")
-    user     = event.get("user", "")
-    text     = event.get("text", "")
+    channel = event.get("channel", "")
+    user    = event.get("user", "")
+    text    = event.get("text", "")
 
-    # Get bot's own user ID to strip mentions
-    try:
-        bot_info = slack_client.auth_test()
-        bot_user_id = bot_info["user_id"]
-    except SlackApiError:
-        bot_user_id = ""
+    # Cache bot user ID
+    if not _bot_user_id:
+        try:
+            bot_info = slack_client.auth_test()
+            _bot_user_id = bot_info["user_id"]
+            log.info("Bot user ID: %s", _bot_user_id)
+        except SlackApiError as e:
+            log.error("auth_test failed: %s", e)
 
     # For channel messages, only respond if the bot is mentioned
     channel_type = event.get("channel_type", "")
-    if channel_type in ("channel", "group") and f"<@{bot_user_id}>" not in text:
+    if channel_type in ("channel", "group") and _bot_user_id and f"<@{_bot_user_id}>" not in text:
         return jsonify({"ok": True})
 
     # Run in background so Slack doesn't time out waiting for us
-    thread = threading.Thread(target=handle_message, args=(channel, user, text, bot_user_id), daemon=True)
+    thread = threading.Thread(
+        target=handle_message,
+        args=(channel, user, text, _bot_user_id),
+        daemon=True
+    )
     thread.start()
 
     return jsonify({"ok": True})
