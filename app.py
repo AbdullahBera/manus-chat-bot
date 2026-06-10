@@ -92,13 +92,16 @@ def manus_poll_result(task_id: str, timeout: int = 300) -> str:
     Returns the last assistant message text.
     """
     deadline = time.time() + timeout
-    last_seen_cursor = None
+    next_cursor = None
     result_parts: list[str] = []
+
+    # Brief initial delay to let the task register on Manus servers
+    time.sleep(2)
 
     while time.time() < deadline:
         params = {"task_id": task_id, "order": "asc", "limit": 50}
-        if last_seen_cursor:
-            params["cursor"] = last_seen_cursor
+        if next_cursor:
+            params["cursor"] = next_cursor
 
         try:
             resp = requests.get(f"{MANUS_API_BASE}/task.listMessages", params=params, headers=HEADERS, timeout=30)
@@ -110,15 +113,16 @@ def manus_poll_result(task_id: str, timeout: int = 300) -> str:
 
         if not data.get("ok"):
             log.error("task.listMessages failed: %s", data)
-            return "Sorry, I encountered an error fetching the response from Manus."
+            # Retry on transient not_found (task may still be initializing)
+            time.sleep(4)
+            continue
 
-        # messages may be at top level or under 'data'
-        raw = data.get("data") or data
-        messages = raw.get("messages", []) if isinstance(raw, dict) else []
+        # messages and next_cursor are at the TOP LEVEL of the response (not under 'data')
+        messages = data.get("messages", [])
+        next_cursor = data.get("next_cursor")  # use next_cursor for pagination
         agent_status = "running"
 
         for msg in messages:
-            last_seen_cursor = msg.get("id")
             msg_type = msg.get("type")
 
             if msg_type == "assistant_message":
