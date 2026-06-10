@@ -58,8 +58,10 @@ def manus_create_task(user_message: str) -> str | None:
     try:
         resp = requests.post(f"{MANUS_API_BASE}/task.create", json=payload, headers=HEADERS, timeout=30)
         data = resp.json()
+        log.info("task.create response: %s", data)
         if data.get("ok"):
-            return data["data"]["task_id"]
+            # task_id is at the top level of the response (not nested under 'data')
+            return data.get("task_id")
         log.error("task.create failed: %s", data)
     except Exception as e:
         log.error("task.create exception: %s", e)
@@ -110,7 +112,9 @@ def manus_poll_result(task_id: str, timeout: int = 300) -> str:
             log.error("task.listMessages failed: %s", data)
             return "Sorry, I encountered an error fetching the response from Manus."
 
-        messages = data.get("data", {}).get("messages", [])
+        # messages may be at top level or under 'data'
+        raw = data.get("data") or data
+        messages = raw.get("messages", []) if isinstance(raw, dict) else []
         agent_status = "running"
 
         for msg in messages:
